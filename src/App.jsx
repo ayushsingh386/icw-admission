@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { 
   User, 
   MessageSquare, 
@@ -27,6 +27,7 @@ export default function App() {
   const [error, setError] = useState(null);
   const [titleClicks, setTitleClicks] = useState(0);
   const [searchTerm, setSearchTerm] = useState("");
+  const [isScriptLoaded, setIsScriptLoaded] = useState(false);
   
   // Local state for admissions
   const [admissions, setAdmissions] = useState([
@@ -43,16 +44,39 @@ export default function App() {
   const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
   const times = ['4:00 PM - 5:00 PM', '5:00 PM - 6:00 PM', '6:00 PM - 7:00 PM', '7:00 PM - 8:00 PM'];
 
-  // Secret Admin Access (Click the title 5 times quickly)
-  const handleSecretAccess = () => {
-    const newClicks = titleClicks + 1;
-    if (newClicks >= 5) {
-      setStep(4);
-      setTitleClicks(0);
-    } else {
-      setTitleClicks(newClicks);
-      setTimeout(() => setTitleClicks(0), 2000);
+  /**
+   * Pre-load Razorpay script for production stability
+   */
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    
+    const existingScript = document.querySelector('script[src="https://checkout.razorpay.com/v1/checkout.js"]');
+    if (existingScript) {
+      setIsScriptLoaded(true);
+      return;
     }
+
+    const script = document.createElement("script");
+    script.src = "https://checkout.razorpay.com/v1/checkout.js";
+    script.async = true;
+    script.onload = () => setIsScriptLoaded(true);
+    script.onerror = () => setError("Failed to load payment library. Please refresh.");
+    document.body.appendChild(script);
+  }, []);
+
+  const handleSecretAccess = () => {
+    setTitleClicks(prev => {
+      const next = prev + 1;
+      if (next >= 5) {
+        setStep(4);
+        return 0;
+      }
+      return next;
+    });
+    
+    // Auto-reset timer
+    const timer = setTimeout(() => setTitleClicks(0), 2000);
+    return () => clearTimeout(timer);
   };
 
   const toggleDay = (day) => {
@@ -85,31 +109,14 @@ export default function App() {
     return true;
   };
 
-  const initializeRazorpay = () => {
-    return new Promise((resolve) => {
-      if (window.Razorpay) {
-        resolve(true);
-        return;
-      }
-      const script = document.createElement("script");
-      script.src = "https://checkout.razorpay.com/v1/checkout.js";
-      script.async = true;
-      script.onload = () => resolve(true);
-      script.onerror = () => resolve(false);
-      document.body.appendChild(script);
-    });
-  };
-
   const handlePayment = async () => {
-    setLoading(true);
-    setError(null);
-    const isLoaded = await initializeRazorpay();
-
-    if (!isLoaded) {
-      setError("Payment gateway failed to load. Please check your connection.");
-      setLoading(false);
+    if (!isScriptLoaded || !window.Razorpay) {
+      setError("Payment system is still initializing. Please wait a moment.");
       return;
     }
+
+    setLoading(true);
+    setError(null);
 
     try {
       const options = {
@@ -124,7 +131,8 @@ export default function App() {
             ...formData,
             id: Date.now(),
             status: "Paid",
-            date: new Date().toISOString().split('T')[0]
+            date: new Date().toISOString().split('T')[0],
+            razorpay_id: response.razorpay_payment_id
           };
           setAdmissions(prev => [newEntry, ...prev]);
           setStep(3);
@@ -136,31 +144,53 @@ export default function App() {
           contact: "9999999999"
         },
         theme: { color: "#ed1c24" },
-        modal: { ondismiss: () => setLoading(false) }
+        modal: { 
+          ondismiss: () => setLoading(false),
+          escape: false,
+          backdropclose: false
+        }
       };
       const rzp = new window.Razorpay(options);
       rzp.open();
     } catch (err) {
-      setError("Payment Error: " + err.message);
+      setError("Payment Error: " + (err.message || "Unknown error occurred"));
       setLoading(false);
     }
   };
 
-  const downloadCSV = (data, filename) => {
+  const downloadCSV = useCallback((data, filename) => {
+    if (typeof window === 'undefined') return;
+    
     const headers = ["Name", "Feedback", "Schedule", "Time", "Status", "Date"];
     const rows = data.map(a => [
-      a.studentName,
-      a.demoFeedback.replace(/,/g, ";"),
-      a.preferredDays.join(" & "),
-      a.preferredTime,
-      a.status,
-      a.date
+      `"${a.studentName}"`,
+      `"${a.demoFeedback.replace(/"/g, '""')}"`,
+      `"${a.preferredDays.join(" & ")}"`,
+      `"${a.preferredTime}"`,
+      `"${a.status}"`,
+      `"${a.date}"`
     ]);
-    const csvContent = "data:text/csv;charset=utf-8," + [headers, ...rows].map(e => e.join(",")).join("\n");
+    
+    const csvContent = [headers, ...rows].map(e => e.join(",")).join("\n");
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    
     const link = document.createElement("a");
-    link.href = encodeURI(csvContent);
-    link.download = filename;
+    link.href = url;
+    link.setAttribute("download", filename);
+    document.body.appendChild(link);
     link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }, []);
+
+  const handleDownloadReceipt = () => {
+    const receiptData = [{
+      ...formData,
+      status: "Paid",
+      date: new Date().toISOString().split('T')[0]
+    }];
+    downloadCSV(receiptData, `ICW_Receipt_${formData.studentName.replace(/\s+/g, '_')}.csv`);
   };
 
   const filteredAdmissions = admissions.filter(a => 
@@ -208,6 +238,7 @@ export default function App() {
                 <button 
                   onClick={() => setStep(1)}
                   className="p-2 hover:bg-white rounded-full transition-all border border-transparent hover:border-slate-200 text-slate-400 hover:text-slate-800"
+                  aria-label="Back to form"
                 >
                   <ChevronLeft className="w-6 h-6" />
                 </button>
@@ -230,6 +261,7 @@ export default function App() {
                 <button 
                   onClick={() => downloadCSV(admissions, 'ICW_All_Students.csv')} 
                   className="p-3.5 bg-slate-900 text-white rounded-2xl hover:bg-black transition-all shadow-lg active:scale-90"
+                  title="Download All"
                 >
                   <Download className="w-5 h-5" />
                 </button>
@@ -310,7 +342,7 @@ export default function App() {
                     <input 
                       type="text" 
                       value={formData.studentName} 
-                      onChange={(e) => setFormData({...formData, studentName: e.target.value})}
+                      onChange={(e) => setFormData(prev => ({...prev, studentName: e.target.value}))}
                       className="w-full bg-slate-50 border-2 border-slate-50 rounded-2xl px-6 py-4 focus:border-[#ed1c24] focus:bg-white focus:ring-4 focus:ring-red-50 outline-none transition-all font-bold text-slate-800 placeholder:text-slate-300"
                       placeholder="Enter student's full name"
                     />
@@ -322,7 +354,7 @@ export default function App() {
                     </label>
                     <textarea 
                       value={formData.demoFeedback} 
-                      onChange={(e) => setFormData({...formData, demoFeedback: e.target.value})}
+                      onChange={(e) => setFormData(prev => ({...prev, demoFeedback: e.target.value}))}
                       rows="3" 
                       className="w-full bg-slate-50 border-2 border-slate-50 rounded-2xl px-6 py-4 focus:border-[#ed1c24] focus:bg-white focus:ring-4 focus:ring-red-50 outline-none resize-none transition-all font-bold text-slate-800 placeholder:text-slate-300"
                       placeholder="Share your experience from the demo session..."
@@ -340,6 +372,7 @@ export default function App() {
                       {days.map(day => (
                         <button
                           key={day} 
+                          type="button"
                           onClick={() => toggleDay(day)}
                           className={`py-4 rounded-2xl text-[10px] font-black border-2 transition-all ${
                             formData.preferredDays.includes(day) 
@@ -359,7 +392,7 @@ export default function App() {
                     </label>
                     <select 
                       value={formData.preferredTime} 
-                      onChange={(e) => setFormData({...formData, preferredTime: e.target.value})}
+                      onChange={(e) => setFormData(prev => ({...prev, preferredTime: e.target.value}))}
                       className="w-full bg-slate-50 border-2 border-slate-50 rounded-2xl px-6 py-4 outline-none appearance-none focus:border-[#ed1c24] focus:bg-white transition-all cursor-pointer font-bold text-slate-800"
                     >
                       <option value="">Select a preferred time...</option>
@@ -368,6 +401,7 @@ export default function App() {
                   </div>
 
                   <button 
+                    type="button"
                     onClick={() => validateForm() && setStep(2)} 
                     className="w-full bg-[#ed1c24] text-white font-black py-5 md:py-6 rounded-2xl md:rounded-3xl shadow-[0_20px_40px_-10px_rgba(237,28,36,0.3)] hover:bg-[#d01921] active:scale-[0.97] transition-all flex items-center justify-center gap-3 mt-4 uppercase tracking-[0.2em] text-xs"
                   >
@@ -412,13 +446,14 @@ export default function App() {
 
                   <div className="space-y-5">
                     <button 
+                      type="button"
                       onClick={handlePayment} 
                       disabled={loading} 
                       className="w-full bg-[#ed1c24] text-white font-black py-6 rounded-3xl flex justify-center items-center gap-4 shadow-2xl hover:bg-[#d01921] active:scale-[0.97] disabled:opacity-50 transition-all uppercase tracking-[0.2em] text-xs"
                     >
                       {loading ? <Loader2 className="animate-spin w-6 h-6" /> : "Authorize Payment Now"}
                     </button>
-                    <button onClick={() => setStep(1)} className="text-slate-400 text-[10px] font-black uppercase tracking-[0.3em] hover:text-slate-800 transition-colors">Return to Edit Details</button>
+                    <button type="button" onClick={() => setStep(1)} className="text-slate-400 text-[10px] font-black uppercase tracking-[0.3em] hover:text-slate-800 transition-colors">Return to Edit Details</button>
                   </div>
                 </div>
               )}
@@ -438,12 +473,13 @@ export default function App() {
                   </div>
                   <div className="space-y-4 pt-6 max-w-sm mx-auto">
                     <button 
-                      onClick={() => downloadCSV([admissions[0]], `ICW_Admission_Receipt_${formData.studentName.replace(/\s+/g, '_')}.csv`)} 
+                      type="button"
+                      onClick={handleDownloadReceipt} 
                       className="w-full bg-slate-900 hover:bg-black text-white font-black py-6 rounded-3xl flex justify-center items-center gap-4 transition-all shadow-xl uppercase tracking-widest text-[10px]"
                     >
                       <Download className="w-5 h-5 text-[#ed1c24]" /> Download Admission Receipt
                     </button>
-                    <button onClick={() => window.location.reload()} className="text-gray-400 text-[10px] font-black uppercase tracking-[0.3em] pt-4 hover:text-[#ed1c24] transition-colors">Process Another Admission</button>
+                    <button type="button" onClick={() => window.location.reload()} className="text-gray-400 text-[10px] font-black uppercase tracking-[0.3em] pt-4 hover:text-[#ed1c24] transition-colors">Process Another Admission</button>
                   </div>
                 </div>
               )}
